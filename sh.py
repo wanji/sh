@@ -13,8 +13,20 @@ DESCRIPTION = """
 import os
 import argparse
 import logging
+import ctypes
 
+from scipy.io import loadmat
 import numpy as np
+
+bitsop = ctypes.cdll.LoadLibrary('bitsop.so')
+
+BIT_CNT_MAP = np.array([bin(i).count("1") for i in xrange(256)], np.uint16)
+
+
+class SHParam(object):
+    def __init__(self, param_dic):
+        for key, val in param_dic.iteritems():
+            setattr(self, key, val)
 
 
 def eigs(X, npca):
@@ -24,15 +36,11 @@ def eigs(X, npca):
 
 
 def trainSH(X, nbits):
-    #
-    # Input
-    #   X = features matrix [Nsamples, Nfeatures]
-    #   param.nbits = number of bits (nbits do not need to be a multiple of 8)
-    #
-    #
-    # Spectral Hashing
-    # Y. Weiss, A. Torralba, R. Fergus.
-    # Advances in Neural Information Processing Systems, 2008.
+    """
+    Input
+      X = features matrix [Nsamples, Nfeatures]
+      param.nbits = number of bits (nbits do not need to be a multiple of 8)
+    """
 
     [Nsamples, Ndim] = X.shape
     SHparam = {'nbits': nbits}
@@ -41,7 +49,7 @@ def trainSH(X, nbits):
     # 1) PCA
     npca = min(nbits, Ndim)
     pc, l = eigs(np.cov(X.T), npca)
-    pc[:, 0] *= -1
+    # pc[:, 3] *= -1
     X = X.dot(pc)   # no need to remove the mean
 
     # 2) fit uniform distribution
@@ -72,6 +80,198 @@ def trainSH(X, nbits):
     SHparam['mx'] = mx
     SHparam['modes'] = modes
     return SHparam
+
+
+def loadParam(path):
+    return loadmat(path, struct_as_record=False, squeeze_me=True)['params']
+
+
+def compactbit(b):
+    nSamples, nbits = b.shape
+    nwords = (nbits + 7) / 8
+    B = np.hstack([np.packbits(b[:, i*8:(i+1)*8][:, ::-1], 1)
+                   for i in xrange(nwords)])
+    residue = nbits % 8
+    if residue != 0:
+        B[:, -1] = np.right_shift(B[:, -1], 8 - residue)
+        print 8 - residue
+
+    return B
+
+
+def compressSH(X, SHparam):
+    """
+    [B, U] = compressSH(X, SHparam)
+
+    Input
+    X = features matrix [Nsamples, Nfeatures]
+    SHparam =  parameters (output of trainSH)
+
+    Output
+    B = bits (compacted in 8 bits words)
+    U = value of eigenfunctions (bits in B correspond to U>0)
+    """
+
+    if X.ndim == 1:
+        X = X.reshape((1, -1))
+
+    Nsamples, Ndim = X.shape
+    nbits = SHparam.nbits
+
+    X = X.dot(SHparam.pc)
+    X = X - SHparam.mn.reshape((1, -1))
+    omega0 = np.pi / (SHparam.mx - SHparam.mn)
+    omegas = SHparam.modes * omega0.reshape((1, -1))
+
+    U = np.zeros((Nsamples, nbits))
+    for i in range(nbits):
+        omegai = omegas[i, :]
+        ys = np.sin(X * omegai + np.pi/2)
+        yi = np.prod(ys, 1)
+        U[:, i] = yi
+
+    b = np.require(U > 0, dtype=np.int)
+    B = compactbit(b)
+    return B, U
+
+
+def compressSH2(X, SHparam):
+    """
+    [B, U] = compressSH2(X, SHparam)
+
+    Input
+    X = features matrix [Nsamples, Nfeatures]
+    SHparam =  parameters (output of trainSH)
+
+    Output
+    B = bits (compacted in 8 bits words)
+    U = value of eigenfunctions (bits in B correspond to U>0)
+    """
+
+    if X.ndim == 1:
+        X = X.reshape((1, -1))
+
+    Nsamples, Ndim = X.shape
+    nbits = SHparam.nbits
+
+    X = X.dot(SHparam.pc)
+    X = X - SHparam.mn.reshape((1, -1))
+    omega0 = 0.5 / (SHparam.mx - SHparam.mn)
+    omegas = SHparam.modes * omega0.reshape((1, -1))
+
+    U = np.zeros((Nsamples, nbits))
+    for i in range(nbits):
+        omegai = omegas[i, :]
+        ys = X * omegai + 0.25
+        ys -= np.floor(ys)
+        yi = np.sum(ys < 0.5, 1)
+        U[:, i] = yi
+
+    b = np.require(U % 2 == 0, dtype=np.int)
+    B = compactbit(b)
+    return B, U
+
+
+def hammingDist(B1, B2):
+    """
+    Compute hamming distance between two sets of samples (B1, B2)
+
+    Dh=hammingDist(B1, B2);
+
+    Input
+       B1, B2: compact bit vectors. Each datapoint is one row.
+       size(B1) = [ndatapoints1, nwords]
+       size(B2) = [ndatapoints2, nwords]
+       It is faster if ndatapoints1 < ndatapoints2
+
+    Output
+       Dh = hamming distance.
+       size(Dh) = [ndatapoints1, ndatapoints2]
+
+    example query
+    Dhamm = hammingDist(B2, B1);
+    this will give the same result than:
+       Dhamm = distMat(U2>0, U1>0).^2;
+    the size of the distance matrix is:
+       size(Dhamm) = [Ntest x Ntraining]
+    """
+
+    if B1.ndim == 1:
+        B1 = B1.reshape((1, -1))
+
+    if B2.ndim == 1:
+        B2 = B2.reshape((1, -1))
+
+    npt1, dim1 = B1.shape
+    npt2, dim2 = B2.shape
+
+    if dim1 != dim2:
+        raise Exception("Dimension not consists: %d, %d" % (dim1, dim2))
+
+    Dh = np.zeros((npt1, npt2), np.uint16)
+
+    """
+    for i in xrange(npt2):
+        Dh[:, i] = BIT_CNT_MAP[np.bitwise_xor(B1, B2[i, :])].sum(1)
+    """
+
+    for i in xrange(npt1):
+        Dh[i, :] = BIT_CNT_MAP[np.bitwise_xor(B1[i, :], B2)].sum(1)
+
+    return Dh
+
+
+def hammingDist2(B1, B2):
+    """
+    Compute hamming distance between two sets of samples (B1, B2)
+
+    Dh=hammingDist(B1, B2);
+
+    Input
+       B1, B2: compact bit vectors. Each datapoint is one row.
+       size(B1) = [ndatapoints1, nwords]
+       size(B2) = [ndatapoints2, nwords]
+       It is faster if ndatapoints1 < ndatapoints2
+
+    Output
+       Dh = hamming distance.
+       size(Dh) = [ndatapoints1, ndatapoints2]
+
+    example query
+    Dhamm = hammingDist(B2, B1);
+    this will give the same result than:
+       Dhamm = distMat(U2>0, U1>0).^2;
+    the size of the distance matrix is:
+       size(Dhamm) = [Ntest x Ntraining]
+    """
+
+    if B1.ndim == 1:
+        B1 = B1.reshape((1, -1))
+
+    if B2.ndim == 1:
+        B2 = B2.reshape((1, -1))
+
+    npt1, dim1 = B1.shape
+    npt2, dim2 = B2.shape
+
+    if dim1 != dim2:
+        raise Exception("Dimension not consists: %d, %d" % (dim1, dim2))
+
+    Dh = np.zeros((npt1, npt2), np.uint16)
+
+    """
+    for i in xrange(npt2):
+        Dh[:, i] = BIT_CNT_MAP[np.bitwise_xor(B1, B2[i, :])].sum(1)
+    """
+
+    for i in xrange(npt1):
+        bitsop.hamming(
+            B2.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            B1[i, :].ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            dim1, npt2,
+            Dh[i, :].ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)))
+
+    return Dh
 
 
 def runcmd(cmd):
